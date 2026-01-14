@@ -1,0 +1,102 @@
+from fastapi import FastAPI, HTTPException
+from db import get_snowflake_connection
+from model import *
+
+app = FastAPI()
+
+# Utility to execute queries and fetch results
+def execute_query(creds: SnowflakeCredentials, query: str, params: dict = None):
+    conn = get_snowflake_connection(creds)
+    try:
+        cursor = conn.cursor()
+        cursor.execute(query, params or {})
+        columns = [col[0] for col in cursor.description] if cursor.description else []
+        results = cursor.fetchall()
+        return {"columns": columns, "data": [dict(zip(columns, row)) for row in results]} if columns else {"data": results}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Query execution error: {e}")
+    finally:
+        conn.close()
+
+# Monitor Tasks in Database
+@app.post("/monitor_tasks_db")
+def monitor_tasks_db(creds: SnowflakeCredentials):
+    query = "SHOW TASKS IN DATABASE {database}".format(database=creds.database)
+    return execute_query(creds, query)
+
+# Monitor Task History with or without task name
+@app.post("/monitor_task_history")
+def monitor_task_history(request: TaskMonitorRequest):
+    # Build the filter conditionally
+    task_filter = f"TASK_NAME => '{request.task_name}'" if request.task_name else ""
+    query = f"""
+    SELECT *
+    FROM TABLE(INFORMATION_SCHEMA.TASK_HISTORY(
+        SCHEDULED_TIME_RANGE_START => DATEADD('day', {request.nb_day}, CURRENT_TIMESTAMP())
+        {',' if task_filter else ''} {task_filter}
+    ));
+    """
+    return execute_query(request.creds, query)
+
+# Monitor Snowpipes in Database
+@app.post("/monitor_snowpipes_db")
+def monitor_snowpipes_db(creds: SnowflakeCredentials):
+    query = "SHOW PIPES IN DATABASE {database}".format(database=creds.database)
+    return execute_query(creds, query)
+
+# Monitor Snowpipes Copy History
+@app.post("/monitor_snowpipes_history")
+def monitor_snowpipes_history(request: PiepeMonitorRequest):
+    query = f"""
+    SELECT *
+    FROM TABLE(INFORMATION_SCHEMA.COPY_HISTORY(
+        TABLE_NAME => '{request.table_name}', 
+        START_TIME => DATEADD('hour', {request.nb_day}, CURRENT_TIMESTAMP())
+    ));
+    """
+    return execute_query(request.creds, query)
+
+# Execute Arbitrary Query
+@app.post("/execute_query")
+def execute_custom_query(creds: SnowflakeCredentials, query_input: QueryInput):
+    return execute_query(creds, query_input.query)
+
+# Monitor Stored Procedures
+@app.post("/monitor_usps")
+def monitor_usps(creds: SnowflakeCredentials):
+    query = """
+    SELECT PROCEDURE_NAME, CREATED, LAST_ALTERED, PROCEDURE_SCHEMA, PROCEDURE_OWNER, COMMENT
+    FROM INFORMATION_SCHEMA.PROCEDURES
+    WHERE PROCEDURE_SCHEMA = CURRENT_SCHEMA();
+    """
+    return execute_query(creds, query)
+
+# Monitor Table Data
+@app.post("/monitor_table")
+def monitor_table(request: TableMonitorRequest):
+    query = f"SELECT * FROM {request.creds.db_schema}.{request.table_name};"
+    return execute_query(request.creds, query)
+
+# Monitor Stored Procedure Query History
+@app.post("/usp_query_history")
+def usp_query_history(request: ProcedureMonitorRequest):
+    query = f"""
+    SELECT *
+    FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY
+    WHERE QUERY_TEXT LIKE '%CALL {request.procedure_name}()%' 
+    ORDER BY START_TIME DESC
+    LIMIT 50;
+    """
+    return execute_query(request.creds, query)
+
+# Monitor Tags
+@app.post("/monitor_tags")
+def monitor_tags(creds: SnowflakeCredentials):
+    query = "SELECT * FROM SNOWFLAKE.ACCOUNT_USAGE.TAGS ORDER BY TAG_NAME;"
+    return execute_query(creds, query)
+
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
